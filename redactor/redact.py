@@ -10,7 +10,7 @@ from pathlib import Path
 
 import fitz
 
-from .detectors import Detection, detect
+from .detectors import Detection, detect_page
 
 
 WHITE = (1.0, 1.0, 1.0)
@@ -38,11 +38,14 @@ class RedactionResult:
         return sum(p.rects_found for p in self.pages)
 
 
-def redact_pdf(input_path: Path, output_path: Path) -> RedactionResult:
+def redact_pdf(
+    input_path: Path, output_path: Path, password: str | None = None
+) -> RedactionResult:
     """Redact PII in the given PDF and write to `output_path`.
 
     Refuses to overwrite the source file — the caller must provide an
     `output_path` that resolves to a different location than `input_path`.
+    For encrypted PDFs, pass `password`; the saved output is unencrypted.
     """
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -60,19 +63,43 @@ def redact_pdf(input_path: Path, output_path: Path) -> RedactionResult:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     doc = fitz.open(input_path)
+    if doc.needs_pass:
+        if not password or not doc.authenticate(password):
+            doc.close()
+            raise ValueError(
+                f"Encrypted PDF requires a valid password: {input_path.name}"
+            )
     page_results: list[PageResult] = []
 
     try:
+        # Pass 1: detect on every page.
+        per_page_detections: dict[int, list[Detection]] = {}
         for i, page in enumerate(doc):
-            text = page.get_text()
-            detections = detect(text)
+            per_page_detections[i] = detect_page(page)
+
+        # Repeated values (name, employer, IDs, account) may appear elsewhere
+        # in the document — for example the Menora transaction table repeats
+        # the employer on every row. Collect every detected value string so
+        # a second `search_for` pass can catch those occurrences too.
+        value_strs: set[str] = set()
+        for dets in per_page_detections.values():
+            for d in dets:
+                if d.kind != "title" and d.text:
+                    value_strs.add(d.text)
+
+        # Pass 2: apply rects from detection + search_for for values.
+        for i, page in enumerate(doc):
+            detections = per_page_detections[i]
             rects_found = 0
             for d in detections:
-                rects = page.search_for(d.text)
-                for rect in rects:
+                for rect in d.rects:
                     page.add_redact_annot(rect, fill=WHITE)
                     rects_found += 1
-            if detections:
+            for value in value_strs:
+                for rect in page.search_for(value):
+                    page.add_redact_annot(rect, fill=WHITE)
+                    rects_found += 1
+            if rects_found:
                 page.apply_redactions()
             page_results.append(
                 PageResult(page_index=i, detections=detections, rects_found=rects_found)

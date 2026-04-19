@@ -4,10 +4,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import fitz
 from PyQt6.QtCore import Qt, QSettings, QThread, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -15,6 +18,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -50,16 +54,19 @@ class RedactionWorker(QThread):
     finished_one = pyqtSignal(object)  # JobOutcome
     all_done = pyqtSignal()
 
-    def __init__(self, paths: list[Path], output_dir: Path) -> None:
+    def __init__(
+        self, paths: list[Path], output_dir: Path, password: str | None = None
+    ) -> None:
         super().__init__()
         self._paths = paths
         self._output_dir = output_dir
+        self._password = password
 
     def run(self) -> None:
         for p in self._paths:
             try:
-                out_path = self._output_dir / p.name
-                result = redact_pdf(p, output_path=out_path)
+                out_path = _unique_path(self._output_dir / p.name)
+                result = redact_pdf(p, output_path=out_path, password=self._password)
                 msg = (
                     f"{result.total_detections} items redacted "
                     f"({result.total_rects} regions) → {result.output_path}"
@@ -68,6 +75,18 @@ class RedactionWorker(QThread):
             except Exception as e:  # noqa: BLE001
                 self.finished_one.emit(JobOutcome(p, False, f"{type(e).__name__}: {e}"))
         self.all_done.emit()
+
+
+def _unique_path(target: Path) -> Path:
+    """Return `target` if free, else bump `_1`, `_2`, … before the suffix."""
+    if not target.exists():
+        return target
+    stem, suffix = target.stem, target.suffix
+    for i in range(1, 10_000):
+        candidate = target.with_name(f"{stem}_{i}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Too many name collisions for {target}")
 
 
 class DropZone(QLabel):
@@ -117,6 +136,39 @@ class DropZone(QLabel):
         ]
         if paths:
             self.files_dropped.emit(paths)
+
+
+class _PasswordDialog(QDialog):
+    """Password prompt with a fixed LTR layout — filenames in Hebrew won't
+    flip the label's paragraph direction to right-aligned."""
+
+    def __init__(self, parent: QWidget, filename: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Encrypted PDF")
+        self.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+
+        label = QLabel(f"'{filename}' is encrypted.\nEnter password:")
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        label.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+
+        self._edit = QLineEdit()
+        self._edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._edit.setMinimumWidth(260)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(label)
+        layout.addWidget(self._edit)
+        layout.addWidget(buttons)
+
+    def password(self) -> str:
+        return self._edit.text()
 
 
 class MainWindow(QMainWindow):
@@ -174,6 +226,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
 
         self._worker: RedactionWorker | None = None
+        self._password: str | None = None
         self._refresh_status()
 
     def _output_dir(self) -> Path | None:
@@ -197,14 +250,46 @@ class MainWindow(QMainWindow):
             self._list.item(i).data(Qt.ItemDataRole.UserRole)
             for i in range(self._list.count())
         }
+        skipped: list[str] = []
         for p in paths:
             if str(p) in existing:
                 continue
-            item = QListWidgetItem(f"⏳ {p.name} — queued")
+            if not self._ensure_unlockable(p):
+                skipped.append(p.name)
+                continue
+            item = QListWidgetItem(f"⏳ {p} — queued")
             item.setData(Qt.ItemDataRole.UserRole, str(p))
             item.setData(STATE_ROLE, STATE_QUEUED)
             self._list.addItem(item)
-        self._refresh_status()
+        if skipped:
+            listed = ", ".join(skipped[:3]) + ("…" if len(skipped) > 3 else "")
+            self._status.setText(f"Skipped (no/wrong password): {listed}")
+        else:
+            self._refresh_status()
+
+    def _ensure_unlockable(self, path: Path) -> bool:
+        """For an encrypted PDF, confirm we have a working password before
+        queuing it — prompts the user and caches the password for reuse."""
+        try:
+            doc = fitz.open(path)
+        except Exception:
+            return True
+        try:
+            if not doc.needs_pass:
+                return True
+            if self._password and doc.authenticate(self._password):
+                return True
+            dialog = _PasswordDialog(self, path.name)
+            if not dialog.exec():
+                return False
+            pw = dialog.password()
+            if doc.authenticate(pw):
+                self._password = pw
+                return True
+            QMessageBox.warning(self, "Wrong password", "Wrong password, try again")
+            return False
+        finally:
+            doc.close()
 
     def _queued_items(self) -> list[tuple[int, Path]]:
         result = []
@@ -240,13 +325,15 @@ class MainWindow(QMainWindow):
 
         for idx, p in queued:
             item = self._list.item(idx)
-            item.setText(f"⏳ {p.name} — processing…")
+            item.setText(f"⏳ {p} — processing…")
             item.setData(STATE_ROLE, STATE_PROCESSING)
 
         self._redact_btn.setEnabled(False)
         self._status.setText(f"Redacting {len(queued)} file(s)…")
 
-        self._worker = RedactionWorker([p for _, p in queued], output_dir)
+        self._worker = RedactionWorker(
+            [p for _, p in queued], output_dir, self._password
+        )
         self._worker.finished_one.connect(self._on_job_done)
         self._worker.all_done.connect(self._on_batch_done)
         self._worker.start()
@@ -264,10 +351,10 @@ class MainWindow(QMainWindow):
                 and item.data(STATE_ROLE) == STATE_PROCESSING
             ):
                 if outcome.ok:
-                    item.setText(f"✅ {outcome.input_path.name} — {outcome.message}")
+                    item.setText(f"✅ {outcome.input_path} — {outcome.message}")
                     item.setData(STATE_ROLE, STATE_DONE)
                 else:
-                    item.setText(f"❌ {outcome.input_path.name} — {outcome.message}")
+                    item.setText(f"❌ {outcome.input_path} — {outcome.message}")
                     item.setData(STATE_ROLE, STATE_ERROR)
                 break
 
