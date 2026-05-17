@@ -56,6 +56,12 @@ _ID_NUM_RE = re.compile(r"\d{8}\s*/\s*\d|\d{9}")
 _TAX_FILE_LABEL_RE = re.compile(r"מספר\s*תיק\s*ניכויים")
 _TAX_FILE_NUM_RE = re.compile(r"\d{6,12}")
 
+# IBI Trade monthly statement: page header "דוח לחשבון מס' XXXXXX".
+# The separator between label and number is the token ":'" so we tolerate any
+# punctuation/whitespace between מס and the digits.
+_IBI_HEADER_LABEL_RE = re.compile(r"דוח\s+לחשבון\s+מס")
+_IBI_HEADER_NUM_RE = re.compile(r"\d{5,9}")
+
 
 def _valid_israeli_id(digits: str) -> bool:
     """Teudat Zehut checksum: weights 1,2,1,2,... summed with digit-of-sum per term."""
@@ -157,6 +163,22 @@ def detect_page(page: fitz.Page) -> list[Detection]:
             _TAX_FILE_LABEL_RE, _TAX_FILE_NUM_RE, "tax_file",
         )
 
+        # IBI Trade: account number in page header "דוח לחשבון מס' XXXXXX"
+        _scan_labeled_number(
+            out, lines, line_idx, row, text, idx_to_word,
+            _IBI_HEADER_LABEL_RE, _IBI_HEADER_NUM_RE, "account",
+        )
+
+        # IBI Trade: "לכבוד" salutation block — label + name + street + city
+        if text.strip() == "לכבוד":
+            out.append(Detection("לכבוד", "title", _rects_of(row)))
+            for offset, kind in [(1, "name"), (2, "street"), (3, "city")]:
+                if line_idx + offset < len(lines):
+                    addr_row = lines[line_idx + offset]
+                    addr_text, _ = _line_text(addr_row)
+                    if addr_text.strip():
+                        out.append(Detection(addr_text.strip(), kind, _rects_of(addr_row)))
+
     return out
 
 
@@ -233,6 +255,28 @@ def detect(text: str) -> list[Detection]:
         for num in _TAX_FILE_NUM_RE.finditer(line):
             out.append(Detection(text=label.group(0).strip(), kind="title"))
             out.append(Detection(text=num.group(0), kind="tax_file"))
+            break
+
+    # IBI Trade: account number in page header
+    for line in text.splitlines():
+        label = _IBI_HEADER_LABEL_RE.search(line)
+        if not label:
+            continue
+        for num in _IBI_HEADER_NUM_RE.finditer(line):
+            out.append(Detection(text=label.group(0).strip(), kind="title"))
+            out.append(Detection(text=num.group(0), kind="account"))
+            break
+
+    # IBI Trade: "לכבוד" salutation block
+    text_lines = text.splitlines()
+    for i, line in enumerate(text_lines):
+        if line.strip() == "לכבוד":
+            out.append(Detection(text="לכבוד", kind="title"))
+            for offset, kind in [(1, "name"), (2, "street"), (3, "city")]:
+                if i + offset < len(text_lines):
+                    addr = text_lines[i + offset].strip()
+                    if addr:
+                        out.append(Detection(text=addr, kind=kind))
             break
 
     seen: set[tuple[str, str]] = set()
