@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
 import fitz
 
-from .detectors import Detection, detect_page
+from .detectors import BIDI_CONTROLS, Detection, detect_page
 
 
 WHITE = (1.0, 1.0, 1.0)
@@ -30,6 +30,18 @@ _FOUR_DIGITS = re.compile(r"\d{4}")
 # may reverse the word, so accept the reversed spellings too.
 _YEAR_LABEL = re.compile(r"ל?שנ[תה]|[הת]נשל?")
 
+# Words that carry no information of their own — a trailing page whose only
+# text is "עמוד 4 מתוך 4" / "Page 4 of 4" is blank for our purposes. Hebrew
+# extraction may reverse the words, so the reversed spellings are listed too.
+_BOILERPLATE_WORDS = re.compile(r"עמוד|מתוך|דומע|ךותמ|page|of", re.IGNORECASE)
+# Matches a letter in any script: digits, punctuation and whitespace on their
+# own never make a page worth keeping.
+_LETTER = re.compile(r"[^\W\d_]")
+# A text-free page holding a lot of vector art is a chart, not a blank page;
+# only light header/footer decoration (rules, crop marks, a logo) counts as
+# blank. IBI's trailing page has ~15 drawings, its content pages ~2200.
+MAX_DECORATIVE_DRAWINGS = 100
+
 
 @dataclass
 class PageResult:
@@ -43,6 +55,7 @@ class RedactionResult:
     input_path: Path
     output_path: Path
     pages: list[PageResult]
+    dropped_pages: list[int] = field(default_factory=list)  # blank, left out
 
     @property
     def total_detections(self) -> int:
@@ -51,6 +64,25 @@ class RedactionResult:
     @property
     def total_rects(self) -> int:
         return sum(p.rects_found for p in self.pages)
+
+
+def page_is_empty(page: fitz.Page) -> bool:
+    """True if `page` carries nothing worth keeping.
+
+    "Nothing" means: no images, no meaningful text once page-number boilerplate
+    (and digits/punctuation) is discarded, and no more vector art than the
+    header/footer decoration these reports put on every page.
+    """
+    if page.get_images():
+        return False
+    text = page.get_text("text").translate(BIDI_CONTROLS)
+    if _LETTER.search(_BOILERPLATE_WORDS.sub("", text)):
+        return False
+    return len(page.get_drawings()) <= MAX_DECORATIVE_DRAWINGS
+
+
+def _empty_page_indices(doc: fitz.Document) -> list[int]:
+    return [i for i, page in enumerate(doc) if page_is_empty(page)]
 
 
 def _stamp_marker(doc: fitz.Document) -> None:
@@ -140,11 +172,22 @@ def find_report_year(path: Path, password: str | None = None) -> int | None:
     return None
 
 
-def merge_pdfs(input_paths: list[Path], output_path: Path) -> Path:
+@dataclass
+class MergeResult:
+    output_path: Path
+    source_count: int
+    pages_kept: int
+    pages_dropped: int  # blank pages left out of the merged file
+
+
+def merge_pdfs(
+    input_paths: list[Path], output_path: Path, drop_empty_pages: bool = True
+) -> MergeResult:
     """Concatenate the given PDFs, in order, into a single file.
 
-    Intended for already-redacted (and therefore unencrypted) outputs, so no
-    password handling here.
+    Blank pages (see `page_is_empty`) are left out unless `drop_empty_pages` is
+    False. Intended for already-redacted (and therefore unencrypted) outputs,
+    so no password handling here.
     """
     paths = [Path(p) for p in input_paths]
     if not paths:
@@ -161,22 +204,40 @@ def merge_pdfs(input_paths: list[Path], output_path: Path) -> Path:
                 merged.insert_pdf(src)
             finally:
                 src.close()
+
+        # Done on the merged document so blanks are caught in every source,
+        # including files that arrived already redacted.
+        dropped = _empty_page_indices(merged) if drop_empty_pages else []
+        if dropped:
+            merged.delete_pages(dropped)
         _stamp_marker(merged)
+        pages_kept = merged.page_count
         merged.save(output_path, garbage=4, deflate=True)
     finally:
         merged.close()
 
-    return output_path
+    return MergeResult(
+        output_path=output_path,
+        source_count=len(paths),
+        pages_kept=pages_kept,
+        pages_dropped=len(dropped),
+    )
 
 
 def redact_pdf(
-    input_path: Path, output_path: Path, password: str | None = None
+    input_path: Path,
+    output_path: Path,
+    password: str | None = None,
+    drop_empty_pages: bool = True,
 ) -> RedactionResult:
     """Redact PII in the given PDF and write to `output_path`.
 
     Refuses to overwrite the source file — the caller must provide an
     `output_path` that resolves to a different location than `input_path`.
     For encrypted PDFs, pass `password`; the saved output is unencrypted.
+    Blank pages (see `page_is_empty`) are left out of the output unless
+    `drop_empty_pages` is False; `PageResult.page_index` keeps referring to the
+    page's position in the *input*.
     """
     input_path = Path(input_path)
     output_path = Path(output_path)
@@ -236,11 +297,20 @@ def redact_pdf(
                 PageResult(page_index=i, detections=detections, rects_found=rects_found)
             )
 
+        # After redaction: a page whose only content was the PII we just removed
+        # can now be blank, so this runs last.
+        dropped = _empty_page_indices(doc) if drop_empty_pages else []
+        if dropped:
+            doc.delete_pages(dropped)
+
         _stamp_marker(doc)
         doc.save(output_path, garbage=4, deflate=True, clean=True)
     finally:
         doc.close()
 
     return RedactionResult(
-        input_path=input_path, output_path=output_path, pages=page_results
+        input_path=input_path,
+        output_path=output_path,
+        pages=page_results,
+        dropped_pages=dropped,
     )

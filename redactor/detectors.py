@@ -17,7 +17,7 @@ import fitz
 
 # Unicode bidi directional-formatting marks. Some Hebrew PDFs embed them in
 # their text streams, which breaks plain-text regex matching.
-_BIDI_CONTROLS = str.maketrans(
+BIDI_CONTROLS = str.maketrans(
     "", "", "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
 )
 
@@ -81,7 +81,7 @@ def _reorder_lines(page: fitz.Page) -> list[list[tuple]]:
     in visual (left-to-right) order, as Menora does."""
     lines: dict[tuple[int, int], list[tuple]] = {}
     for w in page.get_text("words"):
-        cleaned = w[4].translate(_BIDI_CONTROLS)
+        cleaned = w[4].translate(BIDI_CONTROLS)
         if cleaned:
             key = (w[5], w[6])
             lines.setdefault(key, []).append(
@@ -214,7 +214,7 @@ def _scan_labeled_number(out, lines, line_idx, row, text, idx_to_word,
 def detect(text: str) -> list[Detection]:
     """Plain-text detection — kept for unit tests. Returns Detections without
     rectangles; the GUI/CLI pipeline uses `detect_page` instead."""
-    text = text.translate(_BIDI_CONTROLS)
+    text = text.translate(BIDI_CONTROLS)
     out: list[Detection] = []
 
     for m in _NAME_RE.finditer(text):

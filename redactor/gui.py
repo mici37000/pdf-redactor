@@ -101,9 +101,14 @@ class RedactionWorker(QThread):
 
                 out_path = _unique_path(self._output_dir / p.name)
                 result = redact_pdf(p, output_path=out_path, password=self._password)
+                blanks = (
+                    f", {len(result.dropped_pages)} blank page(s) dropped"
+                    if result.dropped_pages
+                    else ""
+                )
                 msg = (
                     f"{result.total_detections} items redacted "
-                    f"({result.total_rects} regions) → {result.output_path}"
+                    f"({result.total_rects} regions){blanks} → {result.output_path}"
                 )
                 redacted.append(result.output_path)
                 self.finished_one.emit(JobOutcome(p, True, msg, result))
@@ -116,11 +121,18 @@ class RedactionWorker(QThread):
             try:
                 year = find_report_year(redacted[-1])
                 stem = f"{MERGED_STEM}{year}" if year else MERGED_STEM
-                merged_path = merge_pdfs(
+                merged = merge_pdfs(
                     redacted, _unique_path(self._output_dir / f"{stem}.pdf")
                 )
+                blanks = (
+                    f", {merged.pages_dropped} blank page(s) dropped"
+                    if merged.pages_dropped
+                    else ""
+                )
                 self.merge_finished.emit(
-                    True, f"{len(redacted)} file(s) merged → {merged_path}"
+                    True,
+                    f"{merged.source_count} file(s) merged into "
+                    f"{merged.pages_kept} page(s){blanks} → {merged.output_path}",
                 )
             except Exception as e:  # noqa: BLE001
                 self.merge_finished.emit(False, f"Merge failed: {type(e).__name__}: {e}")

@@ -24,6 +24,9 @@ def main() -> int:
         print(f"Input:  {result.input_path}")
         print(f"Output: {result.output_path}")
         print(f"Detections: {result.total_detections} ({result.total_rects} regions)")
+        if result.dropped_pages:
+            dropped = ", ".join(str(i + 1) for i in result.dropped_pages)
+            print(f"Blank pages dropped: {dropped}")
         for p in result.pages:
             for d in p.detections:
                 print(f"  page {p.page_index} [{d.kind}] {d.text!r}")
