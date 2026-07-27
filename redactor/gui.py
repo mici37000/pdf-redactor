@@ -9,6 +9,7 @@ from PyQt6.QtCore import Qt, QSettings, QThread, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -24,7 +25,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .redact import RedactionResult, redact_pdf
+from .redact import (
+    RedactionResult,
+    find_report_year,
+    is_already_redacted,
+    merge_pdfs,
+    redact_pdf,
+)
+
+MERGED_STEM = "Merged"
 
 
 ICON_PATH = Path(__file__).parent / "assets" / "icon.svg"
@@ -40,6 +49,8 @@ STATE_QUEUED = "queued"
 STATE_PROCESSING = "processing"
 STATE_DONE = "done"
 STATE_ERROR = "error"
+STATE_MERGED = "merged"
+STATE_SKIPPED = "skipped"
 
 
 @dataclass
@@ -48,32 +59,72 @@ class JobOutcome:
     ok: bool
     message: str
     result: RedactionResult | None = None
+    skipped: bool = False  # recognised as already redacted; no output written
 
 
 class RedactionWorker(QThread):
     finished_one = pyqtSignal(object)  # JobOutcome
+    merge_finished = pyqtSignal(bool, str)  # ok, message
     all_done = pyqtSignal()
 
     def __init__(
-        self, paths: list[Path], output_dir: Path, password: str | None = None
+        self,
+        paths: list[Path],
+        output_dir: Path,
+        password: str | None = None,
+        merge: bool = False,
     ) -> None:
         super().__init__()
         self._paths = paths
         self._output_dir = output_dir
         self._password = password
+        self._merge = merge
 
     def run(self) -> None:
+        # Files fed to the merge: freshly redacted outputs, plus any input that
+        # was already redacted and therefore reused as-is.
+        redacted: list[Path] = []
         for p in self._paths:
             try:
+                if self._merge and is_already_redacted(p, self._password):
+                    redacted.append(p)
+                    self.finished_one.emit(
+                        JobOutcome(
+                            p,
+                            True,
+                            "already redacted — left untouched, used for the merged file",
+                            None,
+                            skipped=True,
+                        )
+                    )
+                    continue
+
                 out_path = _unique_path(self._output_dir / p.name)
                 result = redact_pdf(p, output_path=out_path, password=self._password)
                 msg = (
                     f"{result.total_detections} items redacted "
                     f"({result.total_rects} regions) → {result.output_path}"
                 )
+                redacted.append(result.output_path)
                 self.finished_one.emit(JobOutcome(p, True, msg, result))
             except Exception as e:  # noqa: BLE001
                 self.finished_one.emit(JobOutcome(p, False, f"{type(e).__name__}: {e}"))
+
+        # Merge the redacted outputs (never the originals) into one extra file,
+        # named after the year of the last file that went into it.
+        if self._merge and redacted:
+            try:
+                year = find_report_year(redacted[-1])
+                stem = f"{MERGED_STEM}{year}" if year else MERGED_STEM
+                merged_path = merge_pdfs(
+                    redacted, _unique_path(self._output_dir / f"{stem}.pdf")
+                )
+                self.merge_finished.emit(
+                    True, f"{len(redacted)} file(s) merged → {merged_path}"
+                )
+            except Exception as e:  # noqa: BLE001
+                self.merge_finished.emit(False, f"Merge failed: {type(e).__name__}: {e}")
+
         self.all_done.emit()
 
 
@@ -200,6 +251,14 @@ class MainWindow(QMainWindow):
         out_row.addWidget(self._out_dir_edit, stretch=1)
         out_row.addWidget(self._browse_btn)
 
+        self._merge_check = QCheckBox("Merge files")
+        self._merge_check.setToolTip(
+            "Also write an extra PDF combining all redacted files into one."
+        )
+        # Deliberately not persisted: merging is opt-in per session, so the
+        # box always starts unchecked.
+        self._merge_check.setChecked(False)
+
         self._redact_btn = QPushButton("Redact")
         self._redact_btn.setMinimumHeight(36)
         self._redact_btn.setStyleSheet("QPushButton { font-weight: bold; }")
@@ -221,12 +280,14 @@ class MainWindow(QMainWindow):
         layout.addLayout(out_row)
         layout.addWidget(QLabel("Files:"))
         layout.addWidget(self._list, stretch=1)
+        layout.addWidget(self._merge_check)
         layout.addLayout(buttons)
         layout.addWidget(self._status)
         self.setCentralWidget(root)
 
         self._worker: RedactionWorker | None = None
         self._password: str | None = None
+        self._merge_message: str | None = None
         self._refresh_status()
 
     def _output_dir(self) -> Path | None:
@@ -313,9 +374,13 @@ class MainWindow(QMainWindow):
             self._status.setText("Choose an output folder first (click Browse…).")
             return
 
+        # When merging, dropping previously-redacted outputs back in — which
+        # normally live in this very folder — is the expected workflow: those
+        # files are reused untouched, so a same-folder source is not an error.
+        # Anything still needing redaction is written under a free name.
         out_resolved = output_dir.resolve()
         conflicts = [p.name for _, p in queued if p.parent.resolve() == out_resolved]
-        if conflicts:
+        if conflicts and not self._merge_check.isChecked():
             listed = ", ".join(conflicts[:3]) + ("…" if len(conflicts) > 3 else "")
             self._status.setText(
                 f"Cannot save to the same folder as source file(s): {listed}. "
@@ -331,15 +396,21 @@ class MainWindow(QMainWindow):
         self._redact_btn.setEnabled(False)
         self._status.setText(f"Redacting {len(queued)} file(s)…")
 
+        self._merge_message = None
         self._worker = RedactionWorker(
-            [p for _, p in queued], output_dir, self._password
+            [p for _, p in queued],
+            output_dir,
+            self._password,
+            merge=self._merge_check.isChecked(),
         )
         self._worker.finished_one.connect(self._on_job_done)
+        self._worker.merge_finished.connect(self._on_merge_done)
         self._worker.all_done.connect(self._on_batch_done)
         self._worker.start()
 
     def _clean(self) -> None:
         self._list.clear()
+        self._merge_message = None
         self._refresh_status()
 
     def _on_job_done(self, outcome: JobOutcome) -> None:
@@ -350,13 +421,22 @@ class MainWindow(QMainWindow):
                 item.data(Qt.ItemDataRole.UserRole) == target
                 and item.data(STATE_ROLE) == STATE_PROCESSING
             ):
-                if outcome.ok:
+                if outcome.ok and outcome.skipped:
+                    item.setText(f"↩️ {outcome.input_path} — {outcome.message}")
+                    item.setData(STATE_ROLE, STATE_SKIPPED)
+                elif outcome.ok:
                     item.setText(f"✅ {outcome.input_path} — {outcome.message}")
                     item.setData(STATE_ROLE, STATE_DONE)
                 else:
                     item.setText(f"❌ {outcome.input_path} — {outcome.message}")
                     item.setData(STATE_ROLE, STATE_ERROR)
                 break
+
+    def _on_merge_done(self, ok: bool, message: str) -> None:
+        item = QListWidgetItem(f"{'🔗' if ok else '❌'} {message}")
+        item.setData(STATE_ROLE, STATE_MERGED)
+        self._list.addItem(item)
+        self._merge_message = message
 
     def _on_batch_done(self) -> None:
         self._redact_btn.setEnabled(True)
@@ -375,14 +455,26 @@ class MainWindow(QMainWindow):
             for i in range(self._list.count())
             if self._list.item(i).data(STATE_ROLE) == STATE_DONE
         )
+        reused = sum(
+            1
+            for i in range(self._list.count())
+            if self._list.item(i).data(STATE_ROLE) == STATE_SKIPPED
+        )
         if queued and done:
-            self._status.setText(f"{queued} queued · {done} done. Click Redact to process queued files.")
+            text = f"{queued} queued · {done} done. Click Redact to process queued files."
         elif queued:
-            self._status.setText(f"{queued} file(s) queued. Click Redact to process.")
+            text = f"{queued} file(s) queued. Click Redact to process."
         elif done:
-            self._status.setText(f"{done} file(s) redacted. Drop more or click Clean to reset.")
+            text = f"{done} file(s) redacted. Drop more or click Clean to reset."
+        elif reused:
+            text = "Nothing needed redacting. Drop more or click Clean to reset."
         else:
-            self._status.setText("Drop PDF files to queue them.")
+            text = "Drop PDF files to queue them."
+        if reused:
+            text = f"{text} ({reused} already redacted, reused as-is)"
+        if self._merge_message:
+            text = f"{text} — {self._merge_message}"
+        self._status.setText(text)
 
 
 def run() -> int:

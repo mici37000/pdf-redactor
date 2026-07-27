@@ -5,7 +5,10 @@ this removes the underlying text from the content stream, not just covers it.
 """
 from __future__ import annotations
 
+import re
+from collections import Counter
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import fitz
@@ -14,6 +17,18 @@ from .detectors import Detection, detect_page
 
 
 WHITE = (1.0, 1.0, 1.0)
+
+# Stamped into the Keywords metadata of every file we write, so a later run can
+# recognise its own output and leave it alone.
+REDACTED_MARKER = "pdf-redactor:redacted"
+
+# Plausible range for a report year: old enough for historical statements,
+# one year ahead to tolerate documents issued for the coming year.
+YEAR_MIN = 1990
+_FOUR_DIGITS = re.compile(r"\d{4}")
+# "שנת" / "לשנת" / "שנה" — the year label in these Hebrew reports. Extraction
+# may reverse the word, so accept the reversed spellings too.
+_YEAR_LABEL = re.compile(r"ל?שנ[תה]|[הת]נשל?")
 
 
 @dataclass
@@ -36,6 +51,122 @@ class RedactionResult:
     @property
     def total_rects(self) -> int:
         return sum(p.rects_found for p in self.pages)
+
+
+def _stamp_marker(doc: fitz.Document) -> None:
+    """Append `REDACTED_MARKER` to the document's Keywords metadata."""
+    meta = {k: v for k, v in (doc.metadata or {}).items() if isinstance(v, str)}
+    keywords = (meta.get("keywords") or "").strip()
+    if REDACTED_MARKER not in keywords:
+        meta["keywords"] = f"{keywords}; {REDACTED_MARKER}" if keywords else REDACTED_MARKER
+        doc.set_metadata(meta)
+
+
+def is_already_redacted(path: Path, password: str | None = None) -> bool:
+    """True if `path` looks like it has already been through redaction.
+
+    Two signals: our own `REDACTED_MARKER` in the metadata, or a document that
+    has extractable text yet yields no detections at all. The text requirement
+    keeps scanned/image-only PDFs — where detection cannot see anything in the
+    first place — out of the "already clean" bucket.
+    """
+    path = Path(path)
+    doc = fitz.open(path)
+    try:
+        if doc.needs_pass and not (password and doc.authenticate(password)):
+            # Encrypted and unreadable, and our outputs are never encrypted.
+            return False
+        if REDACTED_MARKER in ((doc.metadata or {}).get("keywords") or ""):
+            return True
+        has_text = False
+        for page in doc:
+            if detect_page(page):
+                return False
+            if not has_text and page.get_text("text").strip():
+                has_text = True
+        return has_text
+    finally:
+        doc.close()
+
+
+def _year_candidates(text: str) -> tuple[list[int], list[int]]:
+    """Return (labelled, all) year candidates found in `text`.
+
+    `labelled` holds only the years on a line that also carries a year label
+    ("שנת" and friends), which is a much stronger signal than a bare number.
+    """
+    year_max = date.today().year + 1
+    labelled: list[int] = []
+    every: list[int] = []
+    for line in text.splitlines():
+        line_years: list[int] = []
+        for match in _FOUR_DIGITS.finditer(line):
+            digits = match.group()
+            year = int(digits)
+            if not YEAR_MIN <= year <= year_max:
+                # Hebrew extraction sometimes emits digit runs right-to-left.
+                year = int(digits[::-1])
+                if not YEAR_MIN <= year <= year_max:
+                    continue
+            line_years.append(year)
+        every.extend(line_years)
+        if line_years and _YEAR_LABEL.search(line):
+            labelled.extend(line_years)
+    return labelled, every
+
+
+def find_report_year(path: Path, password: str | None = None) -> int | None:
+    """Best-effort year of the report in `path`, or None if none is found.
+
+    Prefers years sitting next to a "שנת" label; otherwise falls back to the
+    most frequently mentioned plausible year (ties go to the latest), which
+    picks out the reporting year over incidental dates.
+    """
+    path = Path(path)
+    doc = fitz.open(path)
+    try:
+        if doc.needs_pass and not (password and doc.authenticate(password)):
+            return None
+        text = "\n".join(page.get_text("text") for page in doc)
+    finally:
+        doc.close()
+
+    labelled, every = _year_candidates(text)
+    for candidates in (labelled, every):
+        if candidates:
+            counts = Counter(candidates)
+            best = max(counts, key=lambda y: (counts[y], y))
+            return best
+    return None
+
+
+def merge_pdfs(input_paths: list[Path], output_path: Path) -> Path:
+    """Concatenate the given PDFs, in order, into a single file.
+
+    Intended for already-redacted (and therefore unencrypted) outputs, so no
+    password handling here.
+    """
+    paths = [Path(p) for p in input_paths]
+    if not paths:
+        raise ValueError("No files to merge")
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    merged = fitz.open()
+    try:
+        for p in paths:
+            src = fitz.open(p)
+            try:
+                merged.insert_pdf(src)
+            finally:
+                src.close()
+        _stamp_marker(merged)
+        merged.save(output_path, garbage=4, deflate=True)
+    finally:
+        merged.close()
+
+    return output_path
 
 
 def redact_pdf(
@@ -105,6 +236,7 @@ def redact_pdf(
                 PageResult(page_index=i, detections=detections, rects_found=rects_found)
             )
 
+        _stamp_marker(doc)
         doc.save(output_path, garbage=4, deflate=True, clean=True)
     finally:
         doc.close()
